@@ -161,9 +161,10 @@ class NightscoutUploader:
         )
 
     async def __setBolus(self, rawdata, tz):
-        printdbg("__setBolus()")
+        printdbg("------------- Trying to get a bolus --------------")
         try:
             data = self.__getBolus(rawdata, tz)
+            printdbg(data)
         except Exception as error:
             printdbg(f"__setBolus() exeption: {error}")
             data = []
@@ -218,16 +219,22 @@ class NightscoutUploader:
     async def __set_data(self, host, data, data_type):
         printdbg("__set_data()")
         if len(data) == 0:
+            _LOGGER.info("Nightscout: нет данных для отправки в %s", data_type)
             return False
-        success = True
+    
         url = f"{host}/api/v1/{data_type}"
+        success = True
         try:
             for entry in data:
+                _LOGGER.info("Nightscout: отправка %s -> %s", data_type, url)
                 response = await self.post_async(url, headers=self.__common_headers, data=json.dumps(entry))
-                if not response.status_code == 200:
-                    raise ValueError("__set_data() session response is not OK " + str(response.status_code))
+                if response.status_code == 200:
+                    _LOGGER.info("Nightscout: успешно отправлено в %s", data_type)
+                else:
+                    _LOGGER.error("Nightscout: ошибка %s при отправке в %s", response.status_code, data_type)
+                    success = False
         except Exception as error:
-            printdbg(f"__set_data() failed: exception {error}")
+            _LOGGER.error("Nightscout: исключение при отправке в %s: %s", data_type, error)
             success = False
         return success
 
@@ -271,13 +278,168 @@ class NightscoutUploader:
         return msg.replace("BC_SID_", "").replace("BC_MESSAGE_", "")
 
     def __getBolus(self, raw, tz):
-        meal=self.__get_treatments(raw, "type", "MEAL")
-        meal_carbs = self.__get_dict_values(meal, "timestamp", "amount")
-        insulin=self.__get_treatments(raw, "type", "INSULIN")
-        recomm=self.__get_treatments(insulin, "activationType", "RECOMMENDED")
-        recomm_insulin=self.__get_dict_values(recomm, "timestamp", "deliveredFastAmount")
-        bolus_carbs=self.__get_carbs(recomm_insulin, meal_carbs)
-        return self.__getMealEntries(bolus_carbs, tz)
+        # Local Helper: It is safe to show the data slice for the log
+        def _preview(name, obj, n=2):
+            try:
+                if obj is None:
+                    printdbg(f"{name}: None"); return
+                if isinstance(obj, list):
+                    printdbg(f"{name}: type=list, len={len(obj)}, head={obj[:n]}")
+                elif isinstance(obj, dict):
+                    it = list(obj.items())[:n]
+                    printdbg(f"{name}: type=dict, len={len(obj)}, head={it}")
+                else:
+                    printdbg(f"{name}: type={type(obj).__name__}, value={obj}")
+            except Exception as e:
+                printdbg(f"{name}: <preview error: {e!r}>")
+
+        # Извлечь значение из возможных мест/имён
+        def _get_any(dct, *keys, default=None):
+            for k in keys:
+                if isinstance(dct, dict) and k in dct and dct[k] is not None:
+                    return dct[k]
+            return default
+
+        # Глубокий поиск по возможным путям: ("data","dataValues","deliveredFastAmount") и т.п.
+        def _deep_get(obj, path, default=None):
+            cur = obj
+            for k in path:
+                if not isinstance(cur, dict) or k not in cur:
+                    return default
+                cur = cur[k]
+            return cur
+
+        # Простой ISO->datetime (timezone-aware)
+        from datetime import datetime, timezone, timedelta
+        def _parse_iso(ts):
+            try:
+                # На входе "2025-08-29T22:15:55" (без tz) — считаем, что это локально, потом нормализуем в tz ниже
+                dt = datetime.fromisoformat(str(ts))
+                return dt.replace(tzinfo=tz)
+            except Exception:
+                return None
+
+        # Сопоставить по времени: точное совпадение или ближайшее в пределах window
+        def _merge_by_time(ins_by_ts, carbs_by_ts, window=timedelta(minutes=10)):
+            # exact merge
+            result = {}
+            used_carbs = set()
+
+            # 1) точные совпадения ключей
+            for ts, ins in ins_by_ts.items():
+                if ts in carbs_by_ts:
+                    result[ts] = {"insulin": ins, "carb": carbs_by_ts[ts]}
+                    used_carbs.add(ts)
+
+            # Подготовим списки для ближайшего совпадения
+            remaining_ins = {ts: v for ts, v in ins_by_ts.items() if ts not in result}
+            remaining_carbs = {ts: v for ts, v in carbs_by_ts.items() if ts not in used_carbs}
+
+            if remaining_ins and remaining_carbs:
+                carb_items = list(remaining_carbs.items())
+                # 2) ближайшее по модулю разницы времени
+                for its, ival in remaining_ins.items():
+                    dt_i = _parse_iso(its)
+                    if not dt_i:
+                        continue
+                    best_ts = None
+                    best_diff = None
+                    for cts, cval in carb_items:
+                        if cts in used_carbs:
+                            continue
+                        dt_c = _parse_iso(cts)
+                        if not dt_c:
+                            continue
+                        diff = abs(dt_i - dt_c)
+                        if diff <= window and (best_diff is None or diff < best_diff):
+                            best_diff = diff
+                            best_ts = cts
+                    if best_ts is not None:
+                        result[its] = {"insulin": ival, "carb": remaining_carbs[best_ts]}
+                        used_carbs.add(best_ts)
+
+            # 3) остатки инсулина без углей — проставим carbs=0
+            for ts, ival in ins_by_ts.items():
+                if ts not in result:
+                    result[ts] = {"insulin": ival, "carb": 0}
+
+            return result
+
+        try:
+            printdbg("----- __getBolus(): start -----")
+            _preview("raw", raw)
+
+            # 1) Достаём все INSULIN (manual/обычные болюсы тоже идут c activationType='UNDETERMINED')
+            insulin_markers = [m for m in raw if isinstance(m, dict) and m.get("type") == "INSULIN"]
+            _preview("insulin_markers (type=INSULIN)", insulin_markers)
+
+            # 2) Фильтруем только быстрые болюсы с доставленной дозой
+            ins_by_ts = {}
+            for m in insulin_markers:
+                dv = _deep_get(m, ("data", "dataValues"), {}) or {}
+                bolus_type = _get_any(dv, "bolusType")
+                delivered = _get_any(dv, "deliveredFastAmount", "deliveredAmount")
+                completed = _get_any(dv, "completed", default=True)
+                if bolus_type == "FAST" and delivered:
+                    try:
+                        dose = float(delivered)
+                    except Exception:
+                        continue
+                    if completed is True:  # берём только завершённые
+                        ts = m.get("timestamp")
+                        if ts:
+                            ins_by_ts[ts] = dose
+            _preview("ins_by_ts (timestamp->insulin)", ins_by_ts)
+
+            # 3) Ищем углеводы. Источники:
+            #   а) маркеры с type='MEAL' (если вдруг есть)
+            #   б) явные поля carbs/carbohydrateAmount где угодно внутри маркера
+            carb_markers = []
+            for m in raw:
+                if m.get("type") == "MEAL":
+                    carb_markers.append(m)
+                    continue
+                # пробуем найти carbs глубоко
+                dv = _deep_get(m, ("data", "dataValues"), {}) or {}
+                carbs = _get_any(dv, "carbs", "carbohydrateAmount", "amount")
+                if carbs is not None and m.get("type") != "INSULIN":  # чтобы не ловить случайные из insulin
+                    carb_markers.append(m)
+
+            _preview("carb_markers (candidates)", carb_markers)
+
+            carbs_by_ts = {}
+            for m in carb_markers:
+                ts = m.get("timestamp")
+                if not ts:
+                    continue
+                dv = _deep_get(m, ("data", "dataValues"), {}) or {}
+                carbs_val = _get_any(dv, "carbs", "carbohydrateAmount", "amount")
+                if carbs_val is None:
+                    # иногда угли могут лежать прямым ключом на верхнем уровне
+                    carbs_val = m.get("carbs")
+                if carbs_val is None:
+                    continue
+                try:
+                    carbs_by_ts[ts] = float(carbs_val)
+                except Exception:
+                    continue
+
+            _preview("carbs_by_ts (timestamp->carbs)", carbs_by_ts)
+
+            # 4) Сопоставляем инсулин и углеводы: точный ts, иначе ближайший в ±10 минут, иначе carbs=0
+            bolus_carbs = _merge_by_time(ins_by_ts, carbs_by_ts)
+            _preview("bolus_carbs (merged insulin+carbs)", bolus_carbs)
+
+            # 5) Готовим записи для Nightscout (используем существующую логику)
+            entries = self.__getMealEntries(bolus_carbs, tz)
+            _preview("entries (final for NS)", entries)
+
+            printdbg("----- __getBolus(): done -----")
+            return entries
+
+        except Exception as e:
+            printdbg(f"__getBolus(): ERROR: {e!r}")
+            raise
 
     def __getAutoBolus(self, raw, tz):
         insulin=self.__get_treatments(raw, "type", "INSULIN")
