@@ -33,7 +33,6 @@ VERSION = "0.4"
 # Constants
 AUTH_EXPIRE_DEADLINE_MINUTES = 10
 CON_CONTEXT_AUTH = "custom_components/carelink/logindata.json"
-RESP_DUMP_FILENAME = "carelink_last_response.json"
 CARELINK_CONFIG_URL = "https://clcloud.minimed.eu/connect/carepartner/v11/discover/android/3.3"
 AUTH_ERROR_CODES = [401,403]
 
@@ -100,18 +99,6 @@ class CarelinkClient:
             self._async_client = httpx.AsyncClient()
         return self._async_client
 
-    async def _write_response_file(self, obj, filename=None):
-        """Write down a json set next to the script (asynchronously)."""
-        # Determine the current file folder
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        target = filename or os.path.join(base_dir, RESP_DUMP_FILENAME)
-        try:
-            async with aiofiles.open(target, "w") as f:
-                await f.write(json.dumps(obj, ensure_ascii=False, indent=2))
-            printdbg(f"The answer is saved to the file: {target}")
-        except Exception as e:
-            printdbg(f"I could not record the answer file: {e}")
-
     async def fetch_async(self, url, headers, params=None):
         """Perform an async get request."""
         response = await self.async_client.get(
@@ -141,10 +128,6 @@ class CarelinkClient:
             url = self.__session_config["baseUrlCumulus"] + "/display/message"
         else:
             url = path
-        
-        # 👇 We print the final URL (for debugging)
-        printdbg(f"Request URL: {url}")
-        
         payload = query_params
         data = request_body
         jsondata = None
@@ -159,11 +142,6 @@ class CarelinkClient:
                 if data is None:
                     headers["Accept"] = "application/json, text/plain, */*"
                     headers["Content-Type"] = "application/json; charset=utf-8"
-                    
-                    # 👇 Additional. request parameters (optionally)
-                    if payload:
-                        printdbg(f"Query params: {payload}")
-                        
                     response = await self.fetch_async(
                         url, headers=headers, params=payload
                     )
@@ -178,10 +156,6 @@ class CarelinkClient:
                         "Accept"
                     ] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
-                    
-                    # 👇 The query body log (carefully from the senses. Data)
-                    printdbg(f"POST body: {data}")
-                    
                     response = await self.post_async(url, headers=headers, data=data)
                     self.__last_response_code = response.status_code
                     if not response.status_code == 200:
@@ -193,9 +167,7 @@ class CarelinkClient:
             except Exception as error:
                 printdbg(f"__get_data() failed: exception {error}")
             else:
-                # 👇 Parsim Json and save to a file next to the script
                 jsondata = json.loads(response.text)
-                await self._write_response_file(jsondata)
 
         return jsondata
 
